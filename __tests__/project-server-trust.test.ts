@@ -158,6 +158,71 @@ describe("project MCP server trust", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("could not save approval"), "warning");
   });
 
+  it("does not start a server whose denial outlives a failed approval removal", async () => {
+    writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node", args: ["one.js"] } } });
+    const { config, trust } = await load();
+    const confirm = vi.fn().mockResolvedValue(true);
+    const ui = { confirm, notify: vi.fn() };
+    await trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const approvalPath = join(home, ".pi", "agent", "mcp-project-approvals.json");
+    const saved = JSON.parse(readFileSync(approvalPath, "utf8")) as {
+      approvals: Array<{ projectRoot: string; definitionHash: string }>;
+      denials: unknown[];
+    };
+    saved.denials = [{
+      projectRoot: saved.approvals[0]?.projectRoot,
+      serverName: "local",
+      definitionHash: saved.approvals[0]?.definitionHash,
+      deniedAt: new Date().toISOString(),
+    }];
+    writeFileSync(approvalPath, `${JSON.stringify(saved)}\n`);
+    vi.resetModules();
+    const reloaded = await load();
+    const result = await reloaded.trust.applyProjectServerTrust(
+      reloaded.config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: false, mode: "print" }),
+    );
+
+    expect(result.config.mcpServers.local.disabled).toBe(true);
+    expect(result.blockedServers.get("local")?.reason).toBe("denied");
+  });
+
+  it("keeps an approval for a different definition when another definition is denied", async () => {
+    const path = join(cwd, ".mcp.json");
+    writeJson(path, { mcpServers: { local: { command: "node", args: ["one.js"] } } });
+    const { config, trust } = await load();
+    const confirm = vi.fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const ui = { confirm, notify: vi.fn() };
+    const ask = () => trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+    await ask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const approvalPath = join(home, ".pi", "agent", "mcp-project-approvals.json");
+    const approved = JSON.parse(readFileSync(approvalPath, "utf8")) as { approvals: Array<{ definitionHash: string }> };
+    const approvedHash = approved.approvals[0]?.definitionHash;
+
+    writeJson(path, { mcpServers: { local: { command: "node", args: ["two.js"] } } });
+    await ask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const stored = JSON.parse(readFileSync(approvalPath, "utf8")) as {
+      approvals: Array<{ definitionHash: string }>;
+      denials: Array<{ definitionHash: string }>;
+    };
+
+    expect(stored.approvals.map((entry) => entry.definitionHash)).toContain(approvedHash);
+    expect(stored.denials.some((entry) => entry.definitionHash === approvedHash)).toBe(false);
+    expect(stored.denials.length).toBe(1);
+  });
+
   it("keeps an approval when a later prompt never settles", async () => {
     writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
     const { config, trust } = await load();
@@ -212,7 +277,10 @@ describe("project MCP server trust", () => {
     await Promise.resolve();
 
     expect(notify).not.toHaveBeenCalled();
-    expect(existsSync(join(home, ".pi", "agent", "mcp-project-approvals.json"))).toBe(false);
+    const stored = JSON.parse(readFileSync(join(home, ".pi", "agent", "mcp-project-approvals.json"), "utf8")) as {
+      approvals: unknown[];
+    };
+    expect(stored.approvals).toEqual([]);
     const denied = await ask();
     expect(denied.blockedServers.get("local")?.reason).toBe("denied");
     await new Promise((resolve) => setTimeout(resolve, 0));

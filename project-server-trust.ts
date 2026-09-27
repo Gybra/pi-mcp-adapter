@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentPath } from "./agent-dir.ts";
@@ -18,9 +18,17 @@ interface ApprovalRecord {
   approvedAt: string;
 }
 
+interface DenialRecord {
+  projectRoot: string;
+  serverName: string;
+  definitionHash: string;
+  deniedAt: string;
+}
+
 interface ApprovalStore {
   version: 1;
   approvals: ApprovalRecord[];
+  denials: DenialRecord[];
 }
 
 export interface ProjectTrustResult {
@@ -86,20 +94,73 @@ function approvalPath(): string {
   return getAgentPath(APPROVALS_FILE);
 }
 
+function isDenialRecord(entry: unknown): entry is DenialRecord {
+  if (!entry || typeof entry !== "object") return false;
+  const record = entry as Partial<DenialRecord>;
+  return typeof record.projectRoot === "string" && typeof record.serverName === "string"
+    && typeof record.definitionHash === "string" && typeof record.deniedAt === "string";
+}
+
+function matchesApprovalIdentity(
+  entry: { projectRoot: string; serverName: string; definitionHash: string },
+  projectRoot: string,
+  serverName: string,
+  definitionHash: string,
+): boolean {
+  return entry.projectRoot === projectRoot && entry.serverName === serverName && entry.definitionHash === definitionHash;
+}
+
 function loadApprovals(): ApprovalStore {
   const path = approvalPath();
-  if (!existsSync(path)) return { version: APPROVALS_VERSION, approvals: [] };
+  if (!existsSync(path)) return { version: APPROVALS_VERSION, approvals: [], denials: [] };
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<ApprovalStore>;
     if (parsed.version !== APPROVALS_VERSION || !Array.isArray(parsed.approvals)) throw new Error("invalid format");
     const approvals = parsed.approvals.filter((entry): entry is ApprovalRecord =>
       !!entry && typeof entry.projectRoot === "string" && typeof entry.serverName === "string"
       && typeof entry.definitionHash === "string" && typeof entry.approvedAt === "string");
-    return { version: APPROVALS_VERSION, approvals };
+    const denials = Array.isArray(parsed.denials) ? parsed.denials.filter(isDenialRecord) : [];
+    return { version: APPROVALS_VERSION, approvals, denials };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     console.warn(`MCP: ignoring invalid project-server approval store ${path}: ${detail}`);
-    return { version: APPROVALS_VERSION, approvals: [] };
+    return { version: APPROVALS_VERSION, approvals: [], denials: [] };
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withApprovalLock<T>(fn: () => T): T {
+  const lockPath = `${approvalPath()}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const started = Date.now();
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      closeSync(fd);
+      break;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+      if (code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > 5_000) unlinkSync(lockPath);
+      } catch {
+        // Another writer removed or replaced the lock.
+      }
+      if (Date.now() - started > 2_000) throw new Error("Timed out waiting for the project-server approval store");
+      sleepSync(20);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // The lock is already gone.
+    }
   }
 }
 
@@ -113,22 +174,34 @@ function writeApprovalStore(store: ApprovalStore): void {
   if (process.platform !== "win32") chmodSync(path, 0o600);
 }
 
-function saveApproval(record: ApprovalRecord): void {
-  const store = loadApprovals();
-  store.approvals = store.approvals.filter(entry =>
-    entry.projectRoot !== record.projectRoot || entry.serverName !== record.serverName);
-  store.approvals.push(record);
-  writeApprovalStore(store);
+function mutateApprovals(mutate: (store: ApprovalStore) => void): void {
+  withApprovalLock(() => {
+    const store = loadApprovals();
+    mutate(store);
+    writeApprovalStore(store);
+  });
 }
 
-function revokeApproval(projectRoot: string, serverName: string): void {
-  if (!existsSync(approvalPath())) return;
-  const store = loadApprovals();
-  const approvals = store.approvals.filter(entry =>
-    entry.projectRoot !== projectRoot || entry.serverName !== serverName);
-  if (approvals.length === store.approvals.length) return;
-  store.approvals = approvals;
-  writeApprovalStore(store);
+function saveApproval(record: ApprovalRecord): void {
+  mutateApprovals((store) => {
+    store.denials = store.denials.filter(entry => !matchesApprovalIdentity(entry, record.projectRoot, record.serverName, record.definitionHash));
+    store.approvals = store.approvals.filter(entry =>
+      entry.projectRoot !== record.projectRoot || entry.serverName !== record.serverName);
+    store.approvals.push(record);
+  });
+}
+
+function recordDenial(projectRoot: string, serverName: string, definitionHash: string): void {
+  mutateApprovals((store) => {
+    store.denials = store.denials.filter(entry => !matchesApprovalIdentity(entry, projectRoot, serverName, definitionHash));
+    store.denials.push({
+      projectRoot,
+      serverName,
+      definitionHash,
+      deniedAt: new Date().toISOString(),
+    });
+    store.approvals = store.approvals.filter(entry => !matchesApprovalIdentity(entry, projectRoot, serverName, definitionHash));
+  });
 }
 
 export function approveProjectServer(cwd: string, serverName: string, definition: ServerDefinition): void {
@@ -177,11 +250,11 @@ function scheduleApprovalPrompt(
         if (!allowed) {
           deniedApprovalPrompts.add(key);
           try {
-            revokeApproval(projectRoot, serverName);
+            recordDenial(projectRoot, serverName, definitionHash);
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             try {
-              ctx.ui.notify(`MCP: could not revoke approval for “${serverName}”: ${detail}`, "warning");
+              ctx.ui.notify(`MCP: could not save denial for “${serverName}”: ${detail}`, "warning");
             } catch {
               // The session may already have shut down.
             }
@@ -243,9 +316,11 @@ export async function applyProjectServerTrust(
     const definition = config.mcpServers[name];
     if (!definition || isServerDisabled(definition)) continue;
     const definitionHash = hashProjectServerDefinition(definition);
-    const approved = approvals.approvals.some(entry =>
-      entry.projectRoot === projectRoot && entry.serverName === name && entry.definitionHash === definitionHash);
-    if (projectTrusted && (approved || (!ctx.hasUI && loaded.projectServerPolicy === "allow"))) continue;
+    const deniedOnDisk = approvals.denials.some(entry =>
+      matchesApprovalIdentity(entry, projectRoot, name, definitionHash));
+    const approved = !deniedOnDisk && approvals.approvals.some(entry =>
+      matchesApprovalIdentity(entry, projectRoot, name, definitionHash));
+    if (projectTrusted && !deniedOnDisk && (approved || (!ctx.hasUI && loaded.projectServerPolicy === "allow"))) continue;
 
     let reason: ProjectServerBlockReason;
     const promptKey = approvalPromptKey(projectRoot, name, definitionHash);
@@ -254,7 +329,7 @@ export async function applyProjectServerTrust(
     } else if (!projectTrusted) {
       reason = "untrusted";
     } else if (!ctx.hasUI) {
-      reason = "approval-required";
+      reason = deniedOnDisk ? "denied" : "approval-required";
     } else {
       reason = "approval-required";
       scheduleApprovalPrompt(ctx, projectRoot, name, definition, source.path, definitionHash);
