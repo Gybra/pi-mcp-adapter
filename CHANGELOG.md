@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Approving a project MCP server no longer waits inside startup. A later extension can replace the editor and detach that dialog; initialization used to stay pending and every prompt then waited up to 30 seconds. The server stays blocked until you approve it, and the approval applies on the next reload. Thanks to [@Gybra](https://github.com/Gybra) for [issue #690](https://github.com/nicobailon/pi-mcp-adapter/issues/690).
 - Repeating a word in an MCP tool search no longer hides tools that match it. Thanks to [@kojizada490-wq](https://github.com/kojizada490-wq) for [PR #678](https://github.com/nicobailon/pi-mcp-adapter/pull/678).
 - Changing a stdio server's `inheritEnv` or `literalEnv` setting now refreshes its cached tools, so search and direct tools no longer show stale entries. Thanks to [@kojizada490-wq](https://github.com/kojizada490-wq) for [PR #683](https://github.com/nicobailon/pi-mcp-adapter/pull/683).
 - Disabled project MCP servers no longer ask for approval or delay interactive startup. Thanks to [@ismailokta](https://github.com/ismailokta) for reporting [issue #685](https://github.com/nicobailon/pi-mcp-adapter/issues/685).

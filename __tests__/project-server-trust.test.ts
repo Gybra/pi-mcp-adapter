@@ -94,25 +94,46 @@ describe("project MCP server trust", () => {
     expect(confirm).not.toHaveBeenCalled();
   });
 
+  it("does not wait on a confirm dialog another extension can detach", async () => {
+    writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
+    const { config, trust } = await load();
+    const confirm = vi.fn(() => new Promise(() => {}));
+
+    const result = await trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui: { confirm } }),
+    );
+
+    expect(result.config.mcpServers.local.disabled).toBe(true);
+    expect(result.blockedServers.get("local")?.reason).toBe("approval-required");
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
   it("persists an interactive approval and re-prompts after the definition changes", async () => {
     const path = join(cwd, ".mcp.json");
     writeJson(path, { mcpServers: { local: { command: "node", args: ["one.js"] } } });
     const { config, trust } = await load();
     const confirm = vi.fn().mockResolvedValue(true);
+    const notify = vi.fn();
+    const ui = { confirm, notify };
 
-    let result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui: { confirm } }));
-    expect(result.blockedServers.size).toBe(0);
+    let result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui }));
+    expect(result.blockedServers.get("local")?.reason).toBe("approval-required");
+    expect(confirm).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(confirm).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(statSync(join(home, ".pi", "agent", "mcp-project-approvals.json")).mode & 0o777).toBe(0o600);
 
-    result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui: { confirm } }));
+    result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui }));
     expect(result.blockedServers.size).toBe(0);
     expect(confirm).toHaveBeenCalledTimes(1);
 
     writeJson(path, { mcpServers: { local: { command: "node", args: ["two.js"] } } });
-    result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui: { confirm } }));
-    expect(result.blockedServers.size).toBe(0);
+    result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui }));
+    expect(result.blockedServers.get("local")?.reason).toBe("approval-required");
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(confirm).toHaveBeenCalledTimes(2);
-    expect(statSync(join(home, ".pi", "agent", "mcp-project-approvals.json")).mode & 0o777).toBe(0o600);
   });
 
   it("skips unapproved servers headlessly unless the global policy allows them", async () => {
@@ -136,10 +157,15 @@ describe("project MCP server trust", () => {
     writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { url: "https://example.test/mcp" } } });
     const { config, trust } = await load();
     const confirm = vi.fn().mockResolvedValue(false);
-    const result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui: { confirm } }));
+    const ui = { confirm, notify: vi.fn() };
+    const result = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui }));
 
     expect(result.config.mcpServers.local.disabled).toBe(true);
-    expect(result.blockedServers.get("local")?.reason).toBe("denied");
+    expect(result.blockedServers.get("local")?.reason).toBe("approval-required");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const denied = await trust.applyProjectServerTrust(config.loadMcpConfigWithSources(undefined, cwd), context({ hasUI: true, mode: "tui", ui }));
+    expect(denied.blockedServers.get("local")?.reason).toBe("denied");
+    expect(confirm).toHaveBeenCalledTimes(1);
     expect(readFileSync(join(cwd, ".mcp.json"), "utf8")).toContain("example.test");
   });
 
