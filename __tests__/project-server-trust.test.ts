@@ -107,6 +107,55 @@ describe("project MCP server trust", () => {
     expect(result.config.mcpServers.local.disabled).toBe(true);
     expect(result.blockedServers.get("local")?.reason).toBe("approval-required");
     expect(confirm).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(confirm).toHaveBeenCalledTimes(1);
+
+    await trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui: { confirm } }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+
+  it("prompts again when the approval dialog throws after the session is gone", async () => {
+    writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
+    const { config, trust } = await load();
+    const confirm = vi.fn(() => {
+      throw new Error("ExtensionContext is no longer valid");
+    });
+    const ui = { confirm, notify: vi.fn() };
+
+    await trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports an approval that cannot be saved", async () => {
+    writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
+    const { config, trust } = await load();
+    const notify = vi.fn();
+    const ui = { confirm: vi.fn().mockResolvedValue(true), notify };
+    const agentDir = join(home, ".pi", "agent");
+    mkdirSync(dirname(agentDir), { recursive: true });
+    writeFileSync(agentDir, "not a directory");
+
+    await trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("could not save approval"), "warning");
   });
 
   it("persists an interactive approval and re-prompts after the definition changes", async () => {

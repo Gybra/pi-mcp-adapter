@@ -148,24 +148,40 @@ function scheduleApprovalPrompt(
   // Awaiting confirm here lets setEditorComponent detach the selector without
   // resolving it, which pins initialization and stalls every later prompt.
   setTimeout(() => {
-    void ctx.ui.confirm(
-      `Allow project MCP server “${serverName}”?`,
-      `Source: ${sourcePath}\nEndpoint: ${describeServer(definition)}\n\nThis server can run local commands or make network requests with your user permissions.\n\nApproving applies on the next /reload.`,
-    ).then((allowed) => {
-      pendingApprovalPrompts.delete(key);
-      if (!allowed) {
-        deniedApprovalPrompts.add(key);
-        return;
-      }
-      approveProjectServer(projectRoot, serverName, definition);
-      try {
-        ctx.ui.notify(`MCP: “${serverName}” approved. Run /reload to start it.`, "info");
-      } catch {
-        // The session may already have shut down.
-      }
-    }, () => {
-      pendingApprovalPrompts.delete(key);
-    });
+    // Drop the in-flight key before showing the dialog. A detached confirm never
+    // settles; keeping the key would skip every later prompt in this process.
+    pendingApprovalPrompts.delete(key);
+    try {
+      void Promise.resolve(ctx.ui.confirm(
+        `Allow project MCP server “${serverName}”?`,
+        `Source: ${sourcePath}\nEndpoint: ${describeServer(definition)}\n\nThis server can run local commands or make network requests with your user permissions.\n\nApproving applies on the next /reload.`,
+      )).then((allowed) => {
+        if (!allowed) {
+          deniedApprovalPrompts.add(key);
+          return;
+        }
+        try {
+          approveProjectServer(projectRoot, serverName, definition);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          try {
+            ctx.ui.notify(`MCP: could not save approval for “${serverName}”: ${detail}`, "warning");
+          } catch {
+            // The session may already have shut down.
+          }
+          return;
+        }
+        try {
+          ctx.ui.notify(`MCP: “${serverName}” approved. Run /reload to start it.`, "info");
+        } catch {
+          // The session may already have shut down.
+        }
+      }, () => {
+        // The host rejected the dialog. A later initialization can prompt again.
+      });
+    } catch {
+      // Pi throws on ctx.ui after reload. Leave the server unapproved so the next init can ask.
+    }
   }, 0);
 }
 
