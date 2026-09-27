@@ -126,7 +126,7 @@ export function approveProjectServer(cwd: string, serverName: string, definition
   });
 }
 
-const pendingApprovalPrompts = new Set<string>();
+const approvalPromptGeneration = new Map<string, number>();
 const deniedApprovalPrompts = new Set<string>();
 
 function approvalPromptKey(projectRoot: string, serverName: string, definitionHash: string): string {
@@ -142,20 +142,23 @@ function scheduleApprovalPrompt(
   definitionHash: string,
 ): void {
   const key = approvalPromptKey(projectRoot, serverName, definitionHash);
-  if (pendingApprovalPrompts.has(key) || deniedApprovalPrompts.has(key)) return;
-  pendingApprovalPrompts.add(key);
+  if (deniedApprovalPrompts.has(key)) return;
+  const generation = (approvalPromptGeneration.get(key) ?? 0) + 1;
+  approvalPromptGeneration.set(key, generation);
   // Macrotask so later session_start handlers can install their editor first.
   // Awaiting confirm here lets setEditorComponent detach the selector without
   // resolving it, which pins initialization and stalls every later prompt.
   setTimeout(() => {
-    // Drop the in-flight key before showing the dialog. A detached confirm never
-    // settles; keeping the key would skip every later prompt in this process.
-    pendingApprovalPrompts.delete(key);
+    if (approvalPromptGeneration.get(key) !== generation || deniedApprovalPrompts.has(key)) return;
     try {
       void Promise.resolve(ctx.ui.confirm(
         `Allow project MCP server “${serverName}”?`,
         `Source: ${sourcePath}\nEndpoint: ${describeServer(definition)}\n\nThis server can run local commands or make network requests with your user permissions.\n\nApproving applies on the next /reload.`,
       )).then((allowed) => {
+        // A newer prompt supersedes this one. An older Allow must not persist
+        // after a later Deny, and a later init must still be able to ask again
+        // if this dialog is detached and never settles.
+        if (approvalPromptGeneration.get(key) !== generation || deniedApprovalPrompts.has(key)) return;
         if (!allowed) {
           deniedApprovalPrompts.add(key);
           return;

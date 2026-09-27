@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -156,6 +156,40 @@ describe("project MCP server trust", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("could not save approval"), "warning");
+  });
+
+  it("does not let an older approval override a later denial", async () => {
+    writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
+    const { config, trust } = await load();
+    let resolveFirst: (allowed: boolean) => void = () => {};
+    let resolveSecond: (allowed: boolean) => void = () => {};
+    const confirm = vi.fn()
+      .mockImplementationOnce(() => new Promise<boolean>((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise<boolean>((resolve) => { resolveSecond = resolve; }));
+    const notify = vi.fn();
+    const ui = { confirm, notify };
+    const ask = () => trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+
+    await ask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await ask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(confirm).toHaveBeenCalledTimes(2);
+
+    resolveSecond(false);
+    await Promise.resolve();
+    resolveFirst(true);
+    await Promise.resolve();
+
+    expect(notify).not.toHaveBeenCalled();
+    expect(existsSync(join(home, ".pi", "agent", "mcp-project-approvals.json"))).toBe(false);
+    const denied = await ask();
+    expect(denied.blockedServers.get("local")?.reason).toBe("denied");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(confirm).toHaveBeenCalledTimes(2);
   });
 
   it("persists an interactive approval and re-prompts after the definition changes", async () => {
