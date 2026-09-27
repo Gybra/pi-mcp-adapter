@@ -158,6 +158,33 @@ describe("project MCP server trust", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("could not save approval"), "warning");
   });
 
+  it("keeps an approval when a later prompt never settles", async () => {
+    writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
+    const { config, trust } = await load();
+    let resolveFirst: (allowed: boolean) => void = () => {};
+    const confirm = vi.fn()
+      .mockImplementationOnce(() => new Promise<boolean>((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise<boolean>(() => {}));
+    const notify = vi.fn();
+    const ui = { confirm, notify };
+    const ask = () => trust.applyProjectServerTrust(
+      config.loadMcpConfigWithSources(undefined, cwd),
+      context({ hasUI: true, mode: "tui", ui }),
+    );
+
+    await ask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await ask();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(confirm).toHaveBeenCalledTimes(2);
+
+    resolveFirst(true);
+    await Promise.resolve();
+
+    expect(existsSync(join(home, ".pi", "agent", "mcp-project-approvals.json"))).toBe(true);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("approved"), "info");
+  });
+
   it("does not let an older approval override a later denial", async () => {
     writeJson(join(cwd, ".mcp.json"), { mcpServers: { local: { command: "node" } } });
     const { config, trust } = await load();

@@ -103,18 +103,32 @@ function loadApprovals(): ApprovalStore {
   }
 }
 
-function saveApproval(record: ApprovalRecord): void {
+function writeApprovalStore(store: ApprovalStore): void {
   const path = approvalPath();
-  const store = loadApprovals();
-  store.approvals = store.approvals.filter(entry =>
-    entry.projectRoot !== record.projectRoot || entry.serverName !== record.serverName);
-  store.approvals.push(record);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(store, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   if (process.platform !== "win32") chmodSync(temporary, 0o600);
   renameSync(temporary, path);
   if (process.platform !== "win32") chmodSync(path, 0o600);
+}
+
+function saveApproval(record: ApprovalRecord): void {
+  const store = loadApprovals();
+  store.approvals = store.approvals.filter(entry =>
+    entry.projectRoot !== record.projectRoot || entry.serverName !== record.serverName);
+  store.approvals.push(record);
+  writeApprovalStore(store);
+}
+
+function revokeApproval(projectRoot: string, serverName: string): void {
+  if (!existsSync(approvalPath())) return;
+  const store = loadApprovals();
+  const approvals = store.approvals.filter(entry =>
+    entry.projectRoot !== projectRoot || entry.serverName !== serverName);
+  if (approvals.length === store.approvals.length) return;
+  store.approvals = approvals;
+  writeApprovalStore(store);
 }
 
 export function approveProjectServer(cwd: string, serverName: string, definition: ServerDefinition): void {
@@ -126,7 +140,8 @@ export function approveProjectServer(cwd: string, serverName: string, definition
   });
 }
 
-const approvalPromptGeneration = new Map<string, number>();
+let nextApprovalPromptEpoch = 0;
+const settledApprovalEpoch = new Map<string, number>();
 const deniedApprovalPrompts = new Set<string>();
 
 function approvalPromptKey(projectRoot: string, serverName: string, definitionHash: string): string {
@@ -143,24 +158,34 @@ function scheduleApprovalPrompt(
 ): void {
   const key = approvalPromptKey(projectRoot, serverName, definitionHash);
   if (deniedApprovalPrompts.has(key)) return;
-  const generation = (approvalPromptGeneration.get(key) ?? 0) + 1;
-  approvalPromptGeneration.set(key, generation);
+  const epoch = ++nextApprovalPromptEpoch;
   // Macrotask so later session_start handlers can install their editor first.
   // Awaiting confirm here lets setEditorComponent detach the selector without
   // resolving it, which pins initialization and stalls every later prompt.
   setTimeout(() => {
-    if (approvalPromptGeneration.get(key) !== generation || deniedApprovalPrompts.has(key)) return;
+    if (deniedApprovalPrompts.has(key) || epoch < (settledApprovalEpoch.get(key) ?? 0)) return;
     try {
       void Promise.resolve(ctx.ui.confirm(
         `Allow project MCP server “${serverName}”?`,
         `Source: ${sourcePath}\nEndpoint: ${describeServer(definition)}\n\nThis server can run local commands or make network requests with your user permissions.\n\nApproving applies on the next /reload.`,
       )).then((allowed) => {
-        // A newer prompt supersedes this one. An older Allow must not persist
-        // after a later Deny, and a later init must still be able to ask again
-        // if this dialog is detached and never settles.
-        if (approvalPromptGeneration.get(key) !== generation || deniedApprovalPrompts.has(key)) return;
+        // Scheduling another prompt must not discard this answer. Only a newer
+        // settled decision wins, so a detached dialog cannot drop an Allow and
+        // an older Allow cannot outlive a later Deny.
+        if (epoch < (settledApprovalEpoch.get(key) ?? 0)) return;
+        settledApprovalEpoch.set(key, epoch);
         if (!allowed) {
           deniedApprovalPrompts.add(key);
+          try {
+            revokeApproval(projectRoot, serverName);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            try {
+              ctx.ui.notify(`MCP: could not revoke approval for “${serverName}”: ${detail}`, "warning");
+            } catch {
+              // The session may already have shut down.
+            }
+          }
           return;
         }
         try {
